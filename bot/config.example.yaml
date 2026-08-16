@@ -3,10 +3,11 @@
 telegram:
   chat_id: 123456789        # your numeric Telegram user id (ask @userinfobot)
 
-digest_time: "08:00"        # daily digest, local time (TZ from .env)
+digest_schedule: "daily@08:00"  # default schedule; per-notebook `schedule` overrides.
+                                # Forms: "daily@HH:MM" (local TZ) or "every <N>h" / "every <N>d"
 model: opus                 # claude model for digests and chat
 
-# Notebook name -> goal + digest prompt.
+# Notebook name -> goal + digest prompt (+ optional schedule).
 # The name is the DOCUMENT name (basename): a nested doc like Prep/Piano/Daily
 # is configured as "Daily". Notebooks not listed here are still synced and
 # transcribed, but never trigger a digest.
@@ -18,6 +19,7 @@ notebooks:
       pattern across recent entries and ask one probing question.
       Write in the language the notes are written in.
   Daily:
+    schedule: "every 6h"
     goal: "Track piano practice consistency"
     prompt: >
       Note what was practiced and how it went. Flag anything from the

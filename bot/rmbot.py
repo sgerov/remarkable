@@ -4,20 +4,26 @@
 One process, two loops:
   - telegram_loop: long-polls getUpdates; chat messages are answered with the
     notebook transcript + recent chat history as context (via `claude -p`).
-  - digest_loop: once a day (digest_time, container TZ) runs rm2md.sh to
-    sync + transcribe, then sends one digest message per notebook that got
-    new pages, following that notebook's prompt/goal from config.yaml.
+  - digest_loop: ticks every 10 minutes; when a notebook's schedule is due it
+    runs rm2md.sh (sync + transcribe) and sends a digest of the pages not yet
+    digested for that notebook, following its prompt/goal from config.yaml.
+
+Schedules (per notebook `schedule:`, falling back to global `digest_schedule`):
+  "daily@HH:MM"   fixed local time of day (TZ env)
+  "every Nh"      interval (also "every Nd")
 
 State lives in flat files under DATA_DIR (default /data):
-  rm-sync/        rm2md.sh working dir (mirror, page cache, markdown)
+  rm-sync/            rm2md.sh working dir (mirror, page cache, markdown)
   chat/<name>.jsonl   per-notebook conversation history
-  bot_state.json      active notebook + telegram update offset
+  bot_state.json      active notebook, telegram offset, per-notebook
+                      last_digest + seen_pages (which cache pages were digested)
 """
 
 import asyncio
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -38,23 +44,68 @@ STATE_PATH = DATA_DIR / "bot_state.json"
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 CHAT_TURNS_IN_CONTEXT = 20
 TRANSCRIPT_MAX_CHARS = 300_000  # tail of the transcript fed to Claude
+TICK_SECONDS = 600              # how often the digest loop checks schedules
+
+
+# ── Schedules ──────────────────────────────────────────────────────────────
+def parse_schedule(s: str) -> tuple:
+    """'every 6h'/'every 2d' -> ('every', seconds); 'daily@08:00' -> ('daily', (h, m))."""
+    s = s.strip().lower()
+    m = re.fullmatch(r"every\s+(\d+)\s*([hd])", s)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        return ("every", n * (3600 if unit == "h" else 86400))
+    m = re.fullmatch(r"daily@(\d{1,2}):(\d{2})", s)
+    if m:
+        h, mm = int(m.group(1)), int(m.group(2))
+        if h < 24 and mm < 60:
+            return ("daily", (h, mm))
+    raise ValueError(f"bad schedule '{s}' — use 'every <N>h', 'every <N>d' or 'daily@HH:MM'")
+
+
+def schedule_of(cfg: dict, name: str) -> tuple:
+    return parse_schedule(cfg["notebooks"][name].get("schedule") or cfg["digest_schedule"])
+
+
+def is_due(sched: tuple, last: dt.datetime | None, now: dt.datetime) -> bool:
+    kind, val = sched
+    if last is None:
+        return True  # first sighting: tick runs, sets the baseline silently
+    if kind == "every":
+        return (now - last).total_seconds() >= val
+    occ = now.replace(hour=val[0], minute=val[1], second=0, microsecond=0)
+    if occ > now:
+        occ -= dt.timedelta(days=1)  # most recent scheduled occurrence
+    return last < occ
 
 
 def load_config() -> dict:
     cfg = yaml.safe_load(CONFIG_PATH.read_text())
+    # digest_time is the pre-schedule config key; honour it as the default.
+    cfg.setdefault("digest_schedule", f"daily@{cfg['digest_time']}" if cfg.get("digest_time")
+                   else "daily@08:00")
     cfg.setdefault("model", "opus")
-    cfg.setdefault("digest_time", "08:00")
+    for name in cfg["notebooks"]:  # fail fast on typos
+        schedule_of(cfg, name)
     return cfg
 
 
 def load_state() -> dict:
-    if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text())
-    return {"active": None, "offset": 0}
+    state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
+    state.setdefault("active", None)
+    state.setdefault("offset", 0)
+    state.setdefault("last_digest", {})
+    state.setdefault("seen_pages", {})
+    return state
 
 
 def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state))
+
+
+def last_digest(state: dict, name: str) -> dt.datetime | None:
+    iso = state["last_digest"].get(name)
+    return dt.datetime.fromisoformat(iso) if iso else None
 
 
 def log(*args) -> None:
@@ -74,9 +125,15 @@ def run_claude(prompt: str, model: str) -> str:
 
 
 # ── Notebook context ───────────────────────────────────────────────────────
-def transcript_path(cfg: dict, name: str) -> Path:
+def transcript_path(name: str) -> Path:
     folder = os.environ.get("RM_FOLDER", "Prep")
     return WORK_DIR / "md" / folder / f"{name}.md"
+
+
+def cache_files(name: str) -> set:
+    folder = os.environ.get("RM_FOLDER", "Prep")
+    d = WORK_DIR / "cache" / folder / name
+    return {p.name for p in d.glob("*.md")} if d.is_dir() else set()
 
 
 def chat_log_path(name: str) -> Path:
@@ -104,7 +161,7 @@ def recent_chat(name: str, turns: int = CHAT_TURNS_IN_CONTEXT) -> str:
 
 def build_chat_prompt(cfg: dict, name: str, user_msg: str) -> str:
     nb = cfg["notebooks"][name]
-    md = transcript_path(cfg, name)
+    md = transcript_path(name)
     transcript = md.read_text()[-TRANSCRIPT_MAX_CHARS:] if md.exists() else "(no transcript yet)"
     return f"""You are a Telegram assistant for the reMarkable notebook '{name}'.
 Goal of this notebook: {nb.get('goal', '(none)')}
@@ -127,15 +184,6 @@ Plain text only (no markdown headers or code fences)."""
 
 
 # ── Digest ─────────────────────────────────────────────────────────────────
-def cache_snapshot(cfg: dict) -> dict[str, set]:
-    folder = os.environ.get("RM_FOLDER", "Prep")
-    snap = {}
-    for name in cfg["notebooks"]:
-        d = WORK_DIR / "cache" / folder / name
-        snap[name] = {p.name for p in d.glob("*.md")} if d.is_dir() else set()
-    return snap
-
-
 def run_sync() -> None:
     env = {**os.environ, "WORK_DIR": str(WORK_DIR)}
     proc = subprocess.run([RM2MD], env=env, capture_output=True, text=True, timeout=7200)
@@ -143,7 +191,7 @@ def run_sync() -> None:
         raise RuntimeError(f"rm2md.sh failed:\n{proc.stdout[-1000:]}\n{proc.stderr[-1000:]}")
 
 
-def new_pages_text(cfg: dict, name: str, new_files: set) -> str:
+def new_pages_text(name: str, new_files: set) -> str:
     folder = os.environ.get("RM_FOLDER", "Prep")
     d = WORK_DIR / "cache" / folder / name
     paths = sorted((d / f for f in new_files), key=lambda p: p.stat().st_mtime)
@@ -154,7 +202,7 @@ def build_digest_prompt(cfg: dict, name: str, pages: str) -> str:
     nb = cfg["notebooks"][name]
     return f"""New handwritten pages appeared in the reMarkable notebook '{name}'.
 Goal of this notebook: {nb.get('goal', '(none)')}
-Standing instructions for the daily digest: {nb.get('prompt', '(none)')}
+Standing instructions for the digest: {nb.get('prompt', '(none)')}
 
 New page transcripts:
 <new_pages>
@@ -170,43 +218,49 @@ Write the Telegram digest message to send to the user, following the standing
 instructions. Be concise. Plain text only (no markdown headers or code fences)."""
 
 
-async def run_digest(cfg: dict, chat_id: int, manual: bool = False) -> None:
-    log("digest: syncing...")
-    before = cache_snapshot(cfg)
-    await asyncio.to_thread(run_sync)
-    after = cache_snapshot(cfg)
-
-    changed = {n: after[n] - before[n] for n in cfg["notebooks"] if after[n] - before[n]}
-    if not changed:
-        log("digest: nothing new")
-        if manual:
-            await send(chat_id, "Sync done — nothing new in any configured notebook.")
+async def digest_tick(cfg: dict, state: dict, chat_id: int,
+                      names: list, manual: bool = False) -> None:
+    """Sync once, then digest each notebook in `names` (pages not seen before)."""
+    if not names:
         return
+    log(f"digest: syncing (due: {', '.join(names)})")
+    await asyncio.to_thread(run_sync)
+    now = dt.datetime.now()
+    for name in names:
+        current = cache_files(name)
+        first = name not in state["seen_pages"]
+        new = current - set(state["seen_pages"].get(name, []))
+        if first:
+            log(f"digest: {name} baseline set ({len(current)} existing pages)")
+            if manual:
+                await send(chat_id, f"📓 {name}: baseline set ({len(current)} existing "
+                                    "pages) — digests will cover pages added from now on.")
+        elif new:
+            pages = new_pages_text(name, new)
+            msg = await asyncio.to_thread(
+                run_claude, build_digest_prompt(cfg, name, pages), cfg["model"]
+            )
+            await send(chat_id, f"📓 {name}\n\n{msg}")
+            append_chat(name, "assistant", f"[digest] {msg}")
+            log(f"digest: sent for {name} ({len(new)} new pages)")
+        elif manual:
+            await send(chat_id, f"📓 {name}: nothing new.")
+        state["seen_pages"][name] = sorted(current)
+        state["last_digest"][name] = now.isoformat(timespec="seconds")
+    save_state(state)
 
-    for name, new_files in changed.items():
-        pages = new_pages_text(cfg, name, new_files)
-        msg = await asyncio.to_thread(
-            run_claude, build_digest_prompt(cfg, name, pages), cfg["model"]
-        )
-        await send(chat_id, f"📓 {name}\n\n{msg}")
-        append_chat(name, "assistant", f"[daily digest] {msg}")
-        log(f"digest: sent for {name} ({len(new_files)} new pages)")
 
-
-async def digest_loop(cfg: dict, chat_id: int) -> None:
+async def digest_loop(cfg: dict, state: dict, chat_id: int) -> None:
     while True:
-        hh, mm = map(int, cfg["digest_time"].split(":"))
-        now = dt.datetime.now()
-        nxt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if nxt <= now:
-            nxt += dt.timedelta(days=1)
-        log(f"digest: next run at {nxt}")
-        await asyncio.sleep((nxt - now).total_seconds())
         try:
-            await run_digest(cfg, chat_id)
+            now = dt.datetime.now()
+            due = [n for n in cfg["notebooks"]
+                   if is_due(schedule_of(cfg, n), last_digest(state, n), now)]
+            await digest_tick(cfg, state, chat_id, due)
         except Exception as e:  # noqa: BLE001 — keep the loop alive
             log("digest error:", e)
             await send(chat_id, f"⚠️ digest failed: {e}")
+        await asyncio.sleep(TICK_SECONDS)
 
 
 # ── Telegram ───────────────────────────────────────────────────────────────
@@ -229,8 +283,8 @@ def resolve_notebook(cfg: dict, query: str) -> str | None:
 HELP = """Commands:
 /notebooks — list configured notebooks
 /use <name> — switch the active notebook for chat
-/sync — sync + digest now (instead of waiting for the daily run)
-/status — active notebook and next digest time
+/sync — sync + digest all notebooks now (regardless of schedule)
+/status — active notebook, schedules, last digests
 Anything else — chat about the active notebook (with its transcript as context)."""
 
 
@@ -251,10 +305,15 @@ async def handle_message(cfg: dict, state: dict, chat_id: int, text: str) -> Non
             await send(chat_id, f"No unique match. Configured: {', '.join(cfg['notebooks'])}")
     elif text.startswith("/sync"):
         await send(chat_id, "Syncing…")
-        await run_digest(cfg, chat_id, manual=True)
+        await digest_tick(cfg, state, chat_id, list(cfg["notebooks"]), manual=True)
     elif text.startswith("/status"):
-        await send(chat_id, f"Active notebook: {state['active'] or '(none — /use <name>)'}\n"
-                            f"Daily digest at {cfg['digest_time']} ({os.environ.get('TZ', 'UTC')})")
+        lines = [f"Active notebook: {state['active'] or '(none — /use <name>)'}",
+                 f"Timezone: {os.environ.get('TZ', 'UTC')}"]
+        for n in cfg["notebooks"]:
+            sched = cfg["notebooks"][n].get("schedule") or cfg["digest_schedule"]
+            last = state["last_digest"].get(n, "never")
+            lines.append(f"{n}: {sched} (last digest: {last})")
+        await send(chat_id, "\n".join(lines))
     else:
         name = state["active"]
         if not name:
@@ -298,11 +357,12 @@ async def main() -> None:
     state = load_state()
     chat_id = int(cfg["telegram"]["chat_id"])
     WORK_DIR.mkdir(parents=True, exist_ok=True)
-    log(f"rmbot up — notebooks: {', '.join(cfg['notebooks'])}, "
-        f"digest at {cfg['digest_time']}")
+    scheds = ", ".join(f"{n}={cfg['notebooks'][n].get('schedule') or cfg['digest_schedule']}"
+                       for n in cfg["notebooks"])
+    log(f"rmbot up — {scheds}")
     await asyncio.gather(
         telegram_loop(cfg, state, chat_id),
-        digest_loop(cfg, chat_id),
+        digest_loop(cfg, state, chat_id),
     )
 
 
