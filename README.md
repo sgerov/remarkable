@@ -15,7 +15,10 @@ Telegram bot (`bot/rmbot.py`) that
 cp bot/config.example.yaml config.yaml   # edit: chat_id, notebooks, prompts
 cp .env.example .env                     # edit: tokens (see below)
 docker compose build
-docker compose run --rm rmbot rmapi      # one-time reMarkable pairing (one-time code)
+# reMarkable auth: copy an existing token into ./rmapi/rmapi.conf
+#   (macOS: ~/Library/Application Support/rmapi/rmapi.conf, Linux: ~/.config/rmapi/rmapi.conf)
+# or pair fresh with a one-time code from my.remarkable.com:
+#   docker compose run --rm rmbot rmapi
 docker compose up -d
 ```
 
