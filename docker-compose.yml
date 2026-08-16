@@ -1,0 +1,16 @@
+services:
+  rmbot:
+    build: .
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN}
+      TZ: ${TZ:-Europe/Madrid}
+      # RM_FOLDER: Prep                # reMarkable cloud folder to mirror
+    volumes:
+      - ./data:/data                   # rm-sync mirror, page cache, transcripts, chat logs
+      - ./config.yaml:/app/config.yaml:ro
+      - rmapi-auth:/root/.config/rmapi # reMarkable device token (one-time pairing)
+
+volumes:
+  rmapi-auth:

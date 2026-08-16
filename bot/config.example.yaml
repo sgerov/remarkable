@@ -1,0 +1,24 @@
+# Copy to ../config.yaml (repo root) and edit.
+
+telegram:
+  chat_id: 123456789        # your numeric Telegram user id (ask @userinfobot)
+
+digest_time: "08:00"        # daily digest, local time (TZ from .env)
+model: opus                 # claude model for digests and chat
+
+# Notebook name -> goal + digest prompt.
+# The name is the DOCUMENT name (basename): a nested doc like Prep/Piano/Daily
+# is configured as "Daily". Notebooks not listed here are still synced and
+# transcribed, but never trigger a digest.
+notebooks:
+  Journal:
+    goal: "Reflect on my journaling and keep me accountable"
+    prompt: >
+      Summarize the new pages in 3-5 sentences, then point out one recurring
+      pattern across recent entries and ask one probing question.
+      Write in the language the notes are written in.
+  Daily:
+    goal: "Track piano practice consistency"
+    prompt: >
+      Note what was practiced and how it went. Flag anything from the
+      repertoire that seems abandoned for a while.

@@ -1,0 +1,6 @@
+data/
+Prep/
+.env
+config.yaml
+*.log
+.git/
