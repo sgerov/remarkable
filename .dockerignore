@@ -2,5 +2,6 @@ data/
 Prep/
 .env
 config.yaml
+rmapi/
 *.log
 .git/

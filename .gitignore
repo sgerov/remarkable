@@ -1,0 +1,18 @@
+# Secrets & local config
+.env
+config.yaml
+rmapi/
+
+# Runtime data (docker-compose volume: transcripts, page cache, chat logs)
+data/
+Prep/
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OS
+.DS_Store
