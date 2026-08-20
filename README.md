@@ -24,6 +24,11 @@ run after adding a notebook silently sets a baseline — digests cover pages
 added from then on. `/sync` in Telegram forces a sync + digest of all
 notebooks regardless of schedule.
 
+Claude decides per check whether the new pages warrant a message at all — if
+not, it stays silent and the pages roll over into the next scheduled check.
+With `web_search: true` (global or per notebook), Claude can search the web
+during digests and chat, e.g. to fact-check claims in your notes.
+
 ## Deploy (VPS, Docker)
 
 ```sh

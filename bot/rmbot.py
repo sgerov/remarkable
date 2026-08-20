@@ -67,6 +67,10 @@ def schedule_of(cfg: dict, name: str) -> tuple:
     return parse_schedule(cfg["notebooks"][name].get("schedule") or cfg["digest_schedule"])
 
 
+def web_search_of(cfg: dict, name: str) -> bool:
+    return bool(cfg["notebooks"][name].get("web_search", cfg.get("web_search", False)))
+
+
 def is_due(sched: tuple, last: dt.datetime | None, now: dt.datetime) -> bool:
     kind, val = sched
     if last is None:
@@ -113,10 +117,13 @@ def log(*args) -> None:
 
 
 # ── Claude ─────────────────────────────────────────────────────────────────
-def run_claude(prompt: str, model: str) -> str:
-    """Run `claude -p` with no tools; all context is in the prompt."""
+def run_claude(prompt: str, model: str, web_search: bool = False) -> str:
+    """Run `claude -p`; all context is in the prompt. Optionally allow WebSearch."""
+    cmd = ["claude", "-p", "--model", model]
+    if web_search:
+        cmd += ["--allowedTools", "WebSearch"]
     proc = subprocess.run(
-        ["claude", "-p", "--model", model],
+        cmd,
         input=prompt, capture_output=True, text=True, timeout=600,
     )
     if proc.returncode != 0 or not proc.stdout.strip():
@@ -159,6 +166,13 @@ def recent_chat(name: str, turns: int = CHAT_TURNS_IN_CONTEXT) -> str:
     return "\n".join(out) or "(no previous conversation)"
 
 
+def web_search_note(cfg: dict, name: str) -> str:
+    if not web_search_of(cfg, name):
+        return ""
+    return ("\nYou have web search available — use it to fact-check concrete "
+            "claims, numbers, or assumptions in the notes when it materially helps.\n")
+
+
 def build_chat_prompt(cfg: dict, name: str, user_msg: str) -> str:
     nb = cfg["notebooks"][name]
     md = transcript_path(name)
@@ -166,6 +180,7 @@ def build_chat_prompt(cfg: dict, name: str, user_msg: str) -> str:
     return f"""You are a Telegram assistant for the reMarkable notebook '{name}'.
 Goal of this notebook: {nb.get('goal', '(none)')}
 Standing instructions: {nb.get('prompt', '(none)')}
+{web_search_note(cfg, name)}
 
 Full transcript of the notebook (markdown, pages separated by '---'):
 <transcript>
@@ -203,6 +218,7 @@ def build_digest_prompt(cfg: dict, name: str, pages: str) -> str:
     return f"""New handwritten pages appeared in the reMarkable notebook '{name}'.
 Goal of this notebook: {nb.get('goal', '(none)')}
 Standing instructions for the digest: {nb.get('prompt', '(none)')}
+{web_search_note(cfg, name)}
 
 New page transcripts:
 <new_pages>
@@ -215,7 +231,12 @@ Recent conversation with the user (for tone/continuity):
 </chat>
 
 Write the Telegram digest message to send to the user, following the standing
-instructions. Be concise. Plain text only (no markdown headers or code fences)."""
+instructions. Be concise. Plain text only (no markdown headers or code fences).
+
+You do not have to message the user every time: if, given the goal and standing
+instructions, nothing here genuinely warrants their attention right now, reply
+with exactly SKIP (nothing else) — these pages will be carried over and
+reconsidered together with newer ones at the next scheduled check."""
 
 
 async def digest_tick(cfg: dict, state: dict, chat_id: int,
@@ -238,8 +259,18 @@ async def digest_tick(cfg: dict, state: dict, chat_id: int,
         elif new:
             pages = new_pages_text(name, new)
             msg = await asyncio.to_thread(
-                run_claude, build_digest_prompt(cfg, name, pages), cfg["model"]
+                run_claude, build_digest_prompt(cfg, name, pages), cfg["model"],
+                web_search_of(cfg, name),
             )
+            if msg.strip() == "SKIP":
+                # Nothing worth sending: hold the pages (stay un-seen) so they
+                # roll into the next scheduled check together with newer ones.
+                log(f"digest: {name} held ({len(new)} new pages, nothing to say)")
+                if manual:
+                    await send(chat_id, f"📓 {name}: {len(new)} new pages, "
+                                        "nothing worth a nudge yet.")
+                state["last_digest"][name] = now.isoformat(timespec="seconds")
+                continue
             await send(chat_id, f"📓 {name}\n\n{msg}")
             append_chat(name, "assistant", f"[digest] {msg}")
             log(f"digest: sent for {name} ({len(new)} new pages)")
@@ -321,7 +352,8 @@ async def handle_message(cfg: dict, state: dict, chat_id: int, text: str) -> Non
             return
         append_chat(name, "user", text)
         reply = await asyncio.to_thread(
-            run_claude, build_chat_prompt(cfg, name, text), cfg["model"]
+            run_claude, build_chat_prompt(cfg, name, text), cfg["model"],
+            web_search_of(cfg, name),
         )
         append_chat(name, "assistant", reply)
         await send(chat_id, reply)

@@ -6,8 +6,12 @@ telegram:
 digest_schedule: "daily@08:00"  # default schedule; per-notebook `schedule` overrides.
                                 # Forms: "daily@HH:MM" (local TZ) or "every <N>h" / "every <N>d"
 model: opus                 # claude model for digests and chat
+web_search: false           # let Claude use web search in digests and chat;
+                            # per-notebook `web_search` overrides.
 
-# Notebook name -> goal + digest prompt (+ optional schedule).
+# Notebook name -> goal + digest prompt (+ optional schedule, web_search).
+# A digest is only sent when Claude judges the new pages warrant one — it can
+# reply SKIP, and the pages roll over into the next scheduled check.
 # The name is the DOCUMENT name (basename): a nested doc like Prep/Piano/Daily
 # is configured as "Daily". Notebooks not listed here are still synced and
 # transcribed, but never trigger a digest.
@@ -24,3 +28,16 @@ notebooks:
     prompt: >
       Note what was practiced and how it went. Flag anything from the
       repertoire that seems abandoned for a while.
+  Business:
+    schedule: "daily@08:00"
+    web_search: true
+    goal: "Build recurring revenue from side projects, sustainably"
+    prompt: >
+      About me: software engineer, 4-day work week, limited but real buffer
+      for side projects. This notebook explores what products to build,
+      reflections on what I'm building, and go-to-market. Act as a pragmatic
+      accountability partner: keep me action-oriented and always moving
+      toward recurring revenue, watch for overcommitment and protect me from
+      burnout. Fact-check concrete claims and market assumptions in my notes.
+      Only message me when it genuinely helps me course-correct or move
+      forward — otherwise SKIP and let the notes accumulate.
